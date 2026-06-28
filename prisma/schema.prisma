@@ -1,0 +1,169 @@
+// Aban Dialer - Database Schema
+// Based on SRS.md Section 6 - Data Model
+//
+// This schema is provider-agnostic by design:
+// - No Twilio-specific fields (only generic provider_name, provider_call_id)
+// - No storage-specific fields (only generic recording_storage_provider, recording_storage_key)
+// - Can switch telephony/storage providers without schema changes
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// USERS - Authentication
+// ============================================================================
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  passwordHash  String   @map("password_hash")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  @@map("users")
+}
+
+// ============================================================================
+// NUMBERS - Purchased phone numbers (regardless of provider)
+// ============================================================================
+model Number {
+  id                String   @id @default(uuid())
+  e164Number        String   @unique @map("e164_number") // e.g., +14155551234
+  country           String   // "US" | "AU"
+  providerName      String   @map("provider_name") // "twilio" | "vonage" | etc.
+  providerNumberSid String   @map("provider_number_sid") // Vendor's own ID for this number
+  isActive          Boolean  @default(true) @map("is_active")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  // Relations
+  calls Call[] @relation("NumberFromCalls")
+
+  @@map("numbers")
+}
+
+// ============================================================================
+// CONTACTS - Lead list
+// ============================================================================
+model Contact {
+  id             String    @id @default(uuid())
+  businessName   String    @map("business_name")
+  contactName    String?   @map("contact_name")
+  phoneE164      String    @map("phone_e164")
+  country        String
+  source         String    @default("manual") // "manual" | "csv-import"
+  nextCallbackAt DateTime? @map("next_callback_at") // For FR-11 (call back reminders)
+  notes          String?   @db.Text
+  createdAt      DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  calls Call[]
+
+  @@index([nextCallbackAt]) // For efficient callback queries
+  @@index([phoneE164]) // For quick lookups by phone
+  @@map("contacts")
+}
+
+// ============================================================================
+// CALLS - Call log (provider-agnostic)
+// ============================================================================
+model Call {
+  id                       String    @id @default(uuid())
+  contactId                String?   @map("contact_id") // Nullable: manual dial-pad calls may not match a contact
+  fromNumberId             String    @map("from_number_id")
+  toNumber                 String    @map("to_number")
+  providerName             String    @map("provider_name") // "twilio" | "vonage" | etc.
+  providerCallId           String    @unique @map("provider_call_id") // Vendor's call SID/ID
+  status                   String    // "queued" | "ringing" | "in-progress" | "completed" | "busy" | "failed" | "no-answer" | "canceled"
+  startedAt                DateTime? @map("started_at")
+  answeredAt               DateTime? @map("answered_at")
+  endedAt                  DateTime? @map("ended_at")
+  durationSeconds          Int?      @map("duration_seconds")
+  recordingStorageProvider String?   @map("recording_storage_provider") // "local" | "supabase" | "s3" | "gcs"
+  recordingStorageKey      String?   @map("recording_storage_key") // Key to retrieve recording via IStorageProvider
+  createdAt                DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  contact     Contact?      @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  fromNumber  Number        @relation("NumberFromCalls", fields: [fromNumberId], references: [id])
+  callEvents  CallEvent[]
+  disposition Disposition?
+
+  @@index([contactId]) // For contact history lookups
+  @@index([providerCallId]) // For webhook lookups
+  @@index([status]) // For filtering by status
+  @@index([createdAt]) // For date range queries
+  @@map("calls")
+}
+
+// ============================================================================
+// CALL_EVENTS - Append-only webhook event log
+// ============================================================================
+model CallEvent {
+  id           String   @id @default(uuid())
+  callId       String   @map("call_id")
+  providerName String   @map("provider_name")
+  status       String
+  rawPayload   Json     @map("raw_payload") // Store original webhook payload for debugging
+  receivedAt   DateTime @default(now()) @map("received_at")
+
+  // Relations
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@index([callId]) // For efficient call history queries
+  @@index([receivedAt]) // For chronological queries
+  @@map("call_events")
+}
+
+// ============================================================================
+// DISPOSITIONS - Call outcome tagging
+// ============================================================================
+model Disposition {
+  id        String   @id @default(uuid())
+  callId    String   @unique @map("call_id") // One disposition per call
+  outcome   String   // "interested" | "call_back_later" | "not_interested" | "voicemail" | "wrong_number" | "no_answer" | "other"
+  notes     String?  @db.Text
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  call Call @relation(fields: [callId], references: [id], onDelete: Cascade)
+
+  @@index([outcome]) // For filtering by outcome
+  @@map("dispositions")
+}
+
+// ============================================================================
+// LEADS - Imported lead list for cold calling
+// ============================================================================
+model Lead {
+  id             String    @id @default(uuid())
+  placeId        String?   @map("place_id") // Google Maps place ID (can be empty)
+  businessName   String    @map("business_name")
+  phone          String?   // Phone number (can be empty)
+  address        String?   @db.Text // Full address (can be empty)
+  category       String?   // Business category (locksmith, service, etc.)
+  rating         Float?    // Google rating (1-5, can be null)
+  reviewCount    Int?      @map("review_count") // Number of reviews (can be null)
+  socialOnly     Boolean   @default(false) @map("social_only") // True = has social media only, False = has website
+  website        String?   @db.Text // URL (website or social media link, can be empty)
+  businessStatus String?   @default("OPERATIONAL") @map("business_status") // OPERATIONAL, CLOSED, etc.
+
+  // Lead management fields
+  leadStatus     String    @default("new") @map("lead_status") // "new" | "contacted" | "interested" | "not_interested" | "callback" | "rejected"
+  importedAt     DateTime  @default(now()) @map("imported_at")
+  lastContactedAt DateTime? @map("last_contacted_at")
+  notes          String?   @db.Text
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  @@index([businessName]) // For search
+  @@index([phone]) // For search and deduplication
+  @@index([category]) // For filtering
+  @@index([leadStatus]) // For filtering
+  @@index([socialOnly]) // For filtering
+  @@index([importedAt]) // For sorting
+  @@map("leads")
+}
