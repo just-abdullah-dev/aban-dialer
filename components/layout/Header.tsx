@@ -35,7 +35,7 @@ export default function Header({ onToggleSidebar, showSidebarToggle = false, dia
       <div className="max-w-[1920px] mx-auto px-4 lg:px-6 h-16 flex items-center justify-between">
         {/* Left: Logo (Desktop with Sidebar Toggle / Mobile Simple) */}
         <div className="flex items-center gap-4">
-          {/* Desktop: Show sidebar toggle + full logo
+          {/* Desktop: Show sidebar toggle 
           {showSidebarToggle && (
             <button
               onClick={onToggleSidebar}
